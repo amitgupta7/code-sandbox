@@ -192,13 +192,35 @@ print("connected!")  # never reached
 open("/sandbox/evil.txt", "w").write("x")
 print("wrote file")  # never reached
 ` },
-  { group: "Python", name: "⏱ Timeout — infinite loop killed", lang: "python", timeout: 1000,
+  { group: "Python", name: "🔒 Shell / subprocess — blocked", lang: "python",
+    code:
+`# WASI has no process model: no shell, no subprocess, no fork/exec.
+import os, subprocess
+print("os.system exists:", hasattr(os, "system"))   # False
+subprocess.run(["ls", "/"])   # OSError: wasi does not support processes
+` },
+  { group: "Python", name: "🔒 Native code (ctypes) — blocked", lang: "python",
+    code:
+`# No FFI: ctypes isn't compiled in, so user code can't call into libc/native.
+import ctypes                  # ModuleNotFoundError
+libc = ctypes.CDLL(None)
+libc.system(b"id")            # never reached
+` },
+  { group: "Python", name: "🔒 Host env vars — not leaked", lang: "python",
+    code:
+`# The guest only sees env the host explicitly passes (here: PYTHONPATH).
+# No HOME, PATH, AWS_*, or other host secrets are visible.
+import os
+for k, v in os.environ.items():
+    print(k, "=", v)
+` },
+  { group: "Python", name: "🔒 Timeout — infinite loop killed", lang: "python", timeout: 1000,
     code:
 `# Killed at the wall-clock deadline via epoch interruption.
 while True:
     pass
 ` },
-  { group: "Python", name: "💾 Memory cap — allocation denied", lang: "python", timeout: 10000,
+  { group: "Python", name: "🔒 Memory cap — allocation denied", lang: "python", timeout: 10000,
     code:
 `# The store is capped at 256 MB; this raises MemoryError.
 data = bytearray(400 * 1024 * 1024)
@@ -221,7 +243,7 @@ console.log("color:", Color.Green, Color[2]);
 // args arrive as scriptArgs; scriptArgs[0] is the script path
 for (const a of scriptArgs.slice(1)) console.log("arg:", a);
 ` },
-  { group: "TypeScript", name: "⏱ Timeout — infinite loop killed", lang: "typescript", timeout: 1000,
+  { group: "TypeScript", name: "🔒 Timeout — infinite loop killed", lang: "typescript", timeout: 1000,
     code:
 `while (true) {}
 ` },
@@ -256,7 +278,17 @@ console.log("open /etc/passwd:", std.open("/etc/passwd", "r"));
 const [files, err] = os.readdir("/");
 console.log("readdir / -> err:", err, "files:", JSON.stringify(files));
 ` },
-  { group: "JavaScript", name: "💾 Memory cap — allocation denied", lang: "javascript", timeout: 10000,
+  { group: "JavaScript", name: "🔒 Shell / exec — unavailable", lang: "javascript",
+    code:
+`import * as os from "qjs:os";
+import * as std from "qjs:std";
+
+// Process-spawning APIs aren't built into this QuickJS, and no env is passed.
+console.log("os.exec:", typeof os.exec);        // undefined
+console.log("std.popen:", typeof std.popen);    // undefined
+console.log("host HOME:", std.getenv("HOME"));  // undefined — no env leak
+` },
+  { group: "JavaScript", name: "🔒 Memory cap — allocation denied", lang: "javascript", timeout: 10000,
     code:
 `// The store is capped at 256 MB; this throws "out of memory".
 const chunks = [];
