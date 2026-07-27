@@ -36,34 +36,42 @@ Both languages run *inside* wasm:
 
 ## Quick start
 
+Requires macOS with [Homebrew](https://brew.sh); everything else is bootstrapped
+for you. Run `make help` to see all targets.
+
 ```bash
-# 1. One-time: fetch/build the wasm runtimes into runtimes/
-./scripts/setup-runtimes.sh
-
-# 2. Build (TypeScript support is behind a feature flag)
-cargo build --release --features typescript
-
-# 3. Run
-./target/release/code-sandbox          # listens on 127.0.0.1:8080
+make init        # one-time: install toolchain (Rust, cmake), build wasm runtimes, compile
+make console     # run with the browser playground enabled
 ```
+
+Then open **http://127.0.0.1:8080/console** — pick a language, edit code, set
+stdin/args/timeout, and run (⌘/Ctrl+Enter). It ships with ready-made examples
+(including the security/limit checks) and a live "copy as cURL" panel. When
+you're done:
+
+```bash
+make stop        # stop the running server
+```
+
+### Common targets
+
+| Target | What it does |
+|--------|--------------|
+| `make init` | One-time dev-env setup: toolchain + runtimes + build |
+| `make console` | Run with the `/console` playground enabled (dev only) |
+| `make run` | Run the server without the console |
+| `make stop` | Stop a running server |
+| `make release` | Optimized release build |
+| `make py-deps PKG="humanize jinja2"` | Add pure-Python packages available to sandboxed code |
+| `make test` / `make fmt` / `make clippy` | Test / format / lint |
 
 Env vars: `BIND` (default `127.0.0.1:8080`), `PYTHON_WASM`, `QJS_WASM` (override
-runtime paths; default to `runtimes/*.wasm`), `CONSOLE` (see below).
+runtime paths), `PY_PACKAGES` (dir of pure-Python packages; default
+`runtimes/py-site-packages`), `CONSOLE` (enables `/console`).
 
-### Browser playground
-
-A self-contained testing UI is available at **`/console`**, but only when the
-server is started with the `CONSOLE` flag — it is **off by default** so it can't
-be deployed by accident:
-
-```bash
-make console                 # http://127.0.0.1:8080/console
-# or:  CONSOLE=1 ./target/release/code-sandbox
-```
-
-It lets you pick a language, edit code, set stdin/args/timeout, and run
-(⌘/Ctrl+Enter) against `/run`, showing stdout/stderr/exit code/duration. Keep it
-disabled in production.
+> The `/console` playground is **off by default** and only mounts when the server
+> is started with `CONSOLE=1` (what `make console` does) — so it can't be
+> deployed by accident. Keep it disabled in production.
 
 ## API
 
