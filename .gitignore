@@ -1,0 +1,20 @@
+# Rust
+/target
+Cargo.lock.orig
+
+# Large, regenerable artifacts (build with `make runtimes`)
+/runtimes/*.wasm
+/.toolchain
+/.src
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs / scratch
+*.log
