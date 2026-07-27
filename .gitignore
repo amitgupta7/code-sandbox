@@ -2,8 +2,9 @@
 /target
 Cargo.lock.orig
 
-# Large, regenerable artifacts (build with `make runtimes`)
+# Large, regenerable artifacts (build with `make runtimes` / `make py-deps`)
 /runtimes/*.wasm
+/runtimes/py-site-packages
 /.toolchain
 /.src
 

@@ -38,6 +38,11 @@ tools: ## Install host toolchain on macOS (Homebrew, Rust, cmake)
 runtimes: ## Fetch/build the wasm runtime modules (python.wasm, qjs.wasm)
 	@./scripts/setup-runtimes.sh
 
+py-deps: ## Install pure-Python packages into the mounted dir. Usage: make py-deps PKG="humanize jinja2"
+	@test -n "$(PKG)" || { echo "usage: make py-deps PKG=\"pkg1 pkg2\""; exit 1; }
+	python3 -m pip install --target runtimes/py-site-packages --only-binary :all: $(PKG)
+	@echo "==> Installed into runtimes/py-site-packages: $(PKG)"
+
 build: ## Debug build (with TypeScript support)
 	$(CARGO) build $(CARGO_FEATURES)
 
@@ -50,6 +55,9 @@ run: build ## Build and run the server (BIND overridable, default 127.0.0.1:8080
 console: build ## Run with the browser playground enabled at /console (dev only)
 	@echo "==> Playground: http://127.0.0.1:8080/console"
 	CONSOLE=1 $(CARGO) run $(CARGO_FEATURES)
+
+stop: ## Stop a running server (matches the exact binary name, not this recipe)
+	@pkill -x $(BIN) && echo "stopped $(BIN)" || echo "no running $(BIN)"
 
 test: ## Run the test suite
 	$(CARGO) test $(CARGO_FEATURES)

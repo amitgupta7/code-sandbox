@@ -44,8 +44,20 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no runtimes found: set PYTHON_WASM and/or QJS_WASM, or place them in runtimes/");
     }
 
-    tracing::info!(?python_wasm, ?qjs_wasm, "loading runtimes");
-    let sandbox = Sandbox::new(python_wasm.as_deref(), qjs_wasm.as_deref(), Limits::default())?;
+    // Optional shared dir of pure-Python packages, mounted read-only for every
+    // Python run. Default to runtimes/py-site-packages if present.
+    let py_packages = std::env::var("PY_PACKAGES")
+        .ok()
+        .or_else(|| exists("runtimes/py-site-packages"))
+        .map(std::path::PathBuf::from);
+
+    tracing::info!(?python_wasm, ?qjs_wasm, ?py_packages, "loading runtimes");
+    let sandbox = Sandbox::new(
+        python_wasm.as_deref(),
+        qjs_wasm.as_deref(),
+        py_packages,
+        Limits::default(),
+    )?;
     tracing::info!("runtimes compiled and warm");
 
     let state = AppState {

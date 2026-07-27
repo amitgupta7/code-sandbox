@@ -5,6 +5,7 @@
 //! `Arc`s — this is the local analog of a "warm pod": no per-request compile
 //! cost, just a fresh `Store` + instance per run for isolation.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,9 @@ pub struct Sandbox {
     python: Option<Arc<Module>>,
     qjs: Option<Arc<Module>>,
     limits: Limits,
+    /// Host dir of pure-Python packages, mounted read-only into every Python
+    /// run and added to `sys.path` via `PYTHONPATH`.
+    py_packages: Option<PathBuf>,
 }
 
 /// How a given language is turned into "a wasm module + argv + a source file".
@@ -60,6 +64,10 @@ struct Plan {
     source_file: (String, String),
     /// argv passed to the guest (argv[0] is the program name).
     argv: Vec<String>,
+    /// Environment variables exposed to the guest.
+    env: Vec<(String, String)>,
+    /// Extra read-only dirs to mount: (host path, guest path).
+    extra_preopens: Vec<(PathBuf, String)>,
 }
 
 impl Sandbox {
@@ -67,6 +75,7 @@ impl Sandbox {
     pub fn new(
         python_wasm: Option<&str>,
         qjs_wasm: Option<&str>,
+        py_packages: Option<PathBuf>,
         limits: Limits,
     ) -> Result<Self> {
         let mut config = Config::new();
@@ -94,6 +103,7 @@ impl Sandbox {
             python,
             qjs,
             limits,
+            py_packages,
         })
     }
 
@@ -114,10 +124,22 @@ impl Sandbox {
                     .ok_or_else(|| anyhow!("python runtime not available"))?;
                 let mut argv = vec!["python".to_string(), "/sandbox/main.py".to_string()];
                 argv.extend_from_slice(args);
+
+                // Mount the shared pure-Python packages dir (if configured) and
+                // put it on sys.path via PYTHONPATH.
+                let mut env = Vec::new();
+                let mut extra_preopens = Vec::new();
+                if let Some(pkgs) = &self.py_packages {
+                    env.push(("PYTHONPATH".to_string(), "/packages".to_string()));
+                    extra_preopens.push((pkgs.clone(), "/packages".to_string()));
+                }
+
                 Ok(Plan {
                     module,
                     source_file: ("main.py".to_string(), code.to_string()),
                     argv,
+                    env,
+                    extra_preopens,
                 })
             }
             Language::Javascript | Language::Typescript => {
@@ -137,6 +159,8 @@ impl Sandbox {
                     module,
                     source_file: ("main.js".to_string(), js),
                     argv,
+                    env: Vec::new(),
+                    extra_preopens: Vec::new(),
                 })
             }
         }
@@ -210,6 +234,12 @@ impl Sandbox {
             .stderr(stderr.clone())
             .args(&plan.argv)
             .preopened_dir(dir.path(), "/sandbox", DirPerms::READ, FilePerms::READ)?;
+        for (host, guest) in &plan.extra_preopens {
+            builder.preopened_dir(host, guest, DirPerms::READ, FilePerms::READ)?;
+        }
+        for (k, v) in &plan.env {
+            builder.env(k, v);
+        }
         if let Some(input) = stdin {
             builder.stdin(MemoryInputPipe::new(input.to_string().into_bytes()));
         }
