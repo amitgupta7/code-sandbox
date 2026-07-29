@@ -1,0 +1,807 @@
+Read the whole thing — README, `runtime.rs`, `main.rs`, `transpile.rs`, `Makefile`, `setup-runtimes.sh`, `console.html`. The architecture is sound and the write-up is unusually clear. But there's a gap between what the README claims and what the code currently delivers, and one finding is serious.
+
+## 🔴 1. You're pinned to wasmtime 27.0.0
+
+`Cargo.toml` says `wasmtime = "27"`; `Cargo.lock` resolves 27.0.0 (Nov 2024). 27 isn't an LTS — LTS is every 12th release — so it got two months of support and no backports since Jan 2025. [Wasmtime](https://docs.wasmtime.dev/stability-release.html)
+
+I ran the RustSec database against your lockfile. **18 unpatched advisories** in `wasmtime`/`wasmtime-wasi`. Filtering to ones that actually reach your config (Cranelift, WASIp1, no components, no Winch, no pooling allocator):
+
+| Advisory | Why it hits you |
+|---|---|
+| **RUSTSEC-2026-0096** | Miscompiled guest heap access → **sandbox escape on aarch64 Cranelift**. Your quick start is macOS and `setup-runtimes.sh` leads with `Darwin-arm64`. |
+| **RUSTSEC-2026-0087** | Out-of-sandbox load / segfault, Cranelift x86-64. |
+| **RUSTSEC-2026-0149** | `path_open(TRUNCATE)` bypasses `FilePerms::WRITE`. Your entire isolation story is `DirPerms::READ`/`FilePerms::READ` — and `/packages` is shared across *every* Python run, so this is cross-run tampering. |
+| **RUSTSEC-2025-0046**, **-2026-0182** | `fd_renumber` host panic / leak in WASIp1 → guest kills your server process. |
+| **RUSTSEC-2026-0020** | Guest-controlled resource exhaustion in WASI. |
+
+Two of your README's eight table rows ("code dir mounted read-only", "can't reach other runs") and the "isolation" claim are currently false on the version you ship.
+
+Move to **36.0.12+** (LTS through Aug 2027) or **47.x**. Not a drop-in — `wasmtime-wasi` reorganized `preview1`/`p2` after 27, so budget a day. Then add `cargo-deny`/`cargo-audit` as a `make audit` target in CI plus Dependabot, so this can't silently rot again.
+
+## 🔴 2. The epoch watchdog is engine-global
+
+```rust
+store.set_epoch_deadline(1);          // = current global epoch + 1
+// ...per-request watchdog thread:
+engine.increment_epoch();             // affects EVERY store on this Engine
+```
+
+The epoch counter lives on the `Engine` [Wasmtime](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html) and incrementing it trips currently-executing Wasm code throughout that engine. [Wasmtime](https://docs.wasmtime.dev/api/wasmtime/struct.Engine.html) You have one shared `Engine` and every store's deadline is `current + 1`. So **one request timing out traps every other in-flight request.** An attacker submitting `while True: pass` in a loop makes everyone else's runs fail with `timed_out: true`.
+
+The intended pattern: one long-lived ticker thread incrementing the epoch at a fixed cadence (say 10 ms), and each store gets `set_epoch_deadline(timeout_ms / 10)`. Drop the per-request thread entirely — you also stop spawning an OS thread per request.
+
+## 🟠 3. No global resource ceiling
+
+`memory_bytes: 256 MiB` is per-`Store`. `spawn_blocking` defaults to 512 threads, so worst case is ~128 GiB of guest commit and 512 concurrent instantiations. Add a `tokio::sync::Semaphore` in `AppState`, return `429` when saturated, and set `max_blocking_threads` to match. The README's "can't exhaust the machine" needs this to be true.
+
+## 🟠 4. Zero automated tests
+
+No `tests/`, no `#[cfg(test)]` — `make test` runs nothing. Yet the README says every control is "verified," and verification is currently eight buttons a human clicks. Those eight rows are the highest-value integration tests in the repo: turn each into a `#[test]` asserting the expected `FileNotFoundError`/`PermissionError`/`trapped`/`timed_out`. That's what makes a wasmtime upgrade safe instead of scary.
+
+## 🟡 5. Build provenance
+
+`setup-runtimes.sh` `curl`s `python-3.12.0.wasm` with no checksum, and does `git clone --depth 1` of `quickjs-ng` **unpinned at `main`**. Non-reproducible, and an upstream compromise lands straight in your trusted runtime. Pin a tag, verify SHA-256, record both versions in the README. Also note CPython 3.12.0 is Dec 2023 — in-guest CVEs matter less, but pin deliberately rather than by accident.
+
+## 🟡 6. Config hardening you're leaving on the table
+
+You set only `epoch_interruption(true)`. Worth adding: `wasm_threads(false)` (also retires RUSTSEC-2025-0118), explicitly disable proposals you don't use, and consider `consume_fuel` for deterministic CPU accounting alongside epochs. One roadmap caution: `Module::deserialize` is `unsafe` on untrusted input — only ever feed it artifacts you built with the exact same wasmtime version.
+
+## 🟡 7. Wording I'd change
+
+> *the boundary is a missing capability, not a filter that could be bypassed*
+
+The model is right, but it silently assumes the code generator and WASI host are correct — and RUSTSEC-2026-0096 is precisely a case where they weren't. Also "no host filesystem" isn't literal; you preopen two host dirs. I'd state the threat model, name the pinned wasmtime version, and say plainly that the guarantee is only as strong as that version plus your patch cadence.
+
+## Credit where due
+
+Fresh `Store` per run, warm modules, `MemoryOutputPipe` capacity caps, `I32Exit`/`Trap` discrimination instead of a blanket error, host-side transpile that never executes user code, `CONSOLE` off by default, and a console that uses `textContent` (not `innerHTML`) for guest output — that last one is an XSS you avoided without advertising it. The bones are good. Fix the version pin and the epoch bug and this goes from "demo with a security section" to something defensible.
+
+Going deeper on the *approach* rather than the code. Five things, roughly in order of how much they should change your design.
+
+---
+
+## 1. Your security model is two boundaries, and you're only arguing for one
+
+The README's core claim is capability-theoretic:
+
+> *the boundary is a missing capability, not a filter that could be bypassed*
+
+That's true of exactly one of the two boundaries you depend on:
+
+**The capability boundary** (no `socket()`, no `fork()`, no FFI in the linker). Here the argument is airtight. You can't bypass a host function that was never added to the `Linker`. This is genuinely stronger than seccomp or a container, and it's why wasm is a good choice.
+
+**The memory boundary** (linear-memory bounds checks, control-flow integrity, type safety). This is *not* a missing capability. It's an emergent property of Cranelift emitting correct code. It is precisely "a filter that could be bypassed" — the filter is just a compiler instead of a syscall table.
+
+That second boundary is your entire defense against a guest reading host memory, and its TCB is an optimizing code generator: hundreds of thousands of lines of Rust, per-architecture backends, doing instruction selection and register allocation. Compare Firecracker, where the memory boundary is nested page tables enforced by the MMU — a few thousand lines of setup and silicon doing the work.
+
+Look at which advisories actually hit your configuration. Not one is a capability bypass. They're all in the two components you have to trust rather than merely configure:
+
+- `RUSTSEC-2026-0096` / `-0087` — Cranelift miscompiled a heap access
+- `RUSTSEC-2026-0149`, `-2025-0046`, `-2026-0182` — bugs *in the WASIp1 host implementation*
+
+Your model predicted zero escapes. Empirically there were escapes, in the places the model doesn't cover.
+
+And the base rate just moved. The April 2026 batch came from a multi-agent LLM harness pointed at exactly the security-sensitive surfaces you depend on: Cranelift and Winch codegen, plus the unsafe Rust in the runtime. [Bytecode Alliance](https://bytecodealliance.org/articles/wasmtime-security-advisories) That tooling doesn't get worse. If a compiler is your only memory boundary, your expected escape rate went up structurally — not once, permanently. Plan for a steady stream of Cranelift advisories rather than treating them as freak events.
+
+**What to change:** rewrite the security section as two claims with two different confidence levels. "Capabilities the guest was never granted: strong, structural. Memory isolation: depends on wasmtime version N being correct; here's our patch SLA." That's an honest and still-compelling pitch.
+
+---
+
+## 2. Your wall-clock timeout is bypassable in one line
+
+This is the most exploitable thing I found, and it's an approach-level flaw, not a typo.
+
+Epoch interruption is instrumentation in *compiled wasm code* — checks at function prologues and loop back-edges. Wasmtime's own docs are explicit: epochs and fuel do not help with WebAssembly blocked in a call to the host; if the guest calls poll to sleep, epochs will not wake it up or time it out. Epochs intentionally only affect running WebAssembly code, and it's left to the embedder to handle blocking in the host. [Wasmtime](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html)
+
+Wasmtime issue #9188 is literally your case: a guest calling `clock_nanosleep` blocks the VM for the full 10 seconds even though the epoch deadline is reached mid-call. [GitHub](https://github.com/bytecodealliance/wasmtime/issues/9188)
+
+So:
+
+```python
+import time; time.sleep(3600)   # timeout_ms: 5000 is ignored
+```
+
+`func.call` doesn't return. Your watchdog bumps the epoch into the void. The `spawn_blocking` thread is pinned, the `tempdir` stays alive, and the HTTP handler blocks — for an hour. With tokio's 512-thread default blocking pool, **512 requests fully DoS the service at zero CPU cost to the attacker.** No memory bomb, no infinite loop, nothing your `StoreLimits` or epoch machinery sees.
+
+I couldn't execute this (no cargo or wasm runtimes in my environment), so treat it as high-confidence-from-docs and confirm with a test — but the mechanism is documented behavior, not a bug. Note also that there are blog posts claiming epochs *do* enforce deadlines through host sleeps; they contradict the official docs and issue #9188.
+
+**Fixes, in order of preference:**
+
+1. **`Config::async_support(true)` + async WASI + `tokio::time::timeout`.** This is what wasmtime recommends: blocking becomes a suspended future, and cancellation actually works. Biggest change, correct answer.
+2. **Cap the sleep at the host.** Provide your own `WasiSched`/monotonic clock so `poll_oneoff` can't block longer than the remaining budget.
+3. **Belt-and-braces:** a supervisor that hard-kills the *worker process* at deadline + grace. Which is finding #4.
+
+Whatever you pick, add a `time.sleep(3600)` test with `timeout_ms: 500` to that verification suite.
+
+---
+
+## 3. Audit what you *grant*, not what you deny
+
+Your security table has eight rows and every one is a denial. That's the wrong direction for a capability system — the interesting question is the grant set, because that's the attack surface.
+
+Here's what `WasiCtxBuilder::new()` plus `preview1::add_to_linker_sync` actually hands the guest:
+
+| Granted | Notes |
+|---|---|
+| Full WASIp1 syscall surface | ~45 functions: all `fd_*`, `path_*`, `poll_oneoff`, `sched_yield`, `clock_*`, `random_get` |
+| Two preopened host dirs | `/sandbox`, and `/packages` **shared across every Python run** |
+| argv, selected env, stdio | fine |
+| **Monotonic + wall clock** | the host's monotonic clock is the default [Wasmtime](https://docs.wasmtime.dev/api/wasmtime_wasi/p2/struct.WasiCtxBuilder.html) — you never opted in or out |
+| **Secure random** | also default |
+
+Three consequences you haven't accounted for:
+
+- **The WASIp1 implementation is your real attack surface.** Three of your live advisories are in it. "No syscalls for forbidden operations" is right; "the ~45 syscalls we did grant are correctly implemented" is the load-bearing assumption, and it's the one that failed.
+- **Side channels are absent from your threat model entirely.** A default monotonic clock plus N tenants in one address space plus one Cranelift-generated code region means cache-timing and Spectre-style cross-run inference is on the table. You don't need to solve it, but the README shouldn't imply runs are isolated from each other when they share a process. If you want to close the easy door: swap in a coarsened or deterministic clock.
+- **Runs are non-deterministic.** Real clock plus real randomness means same input, different output. If anyone ever uses this for grading, CI, or agent replay, you want a determinism mode — and wasmtime ships a `Deterministic` RNG impl for exactly this.
+
+`/packages` deserves a callout on its own: it's the one piece of mutable-in-principle state shared by every tenant, and `RUSTSEC-2026-0149` (`path_open(TRUNCATE)` bypassing `FilePerms::WRITE`) makes it writable on the version you ship. That's a cross-tenant persistence primitive — poison a `.py` file in `/packages` and you're executing in every subsequent Python run. It's the highest-severity *consequence* in the whole system, and it exists because you optimized a shared read-only mount instead of giving each run its own view.
+
+---
+
+## 4. One process, N tenants — the structural weakness
+
+Right now every concurrent untrusted program shares: one OS process, one host heap, one JIT code region, one blocking-thread pool, one `/packages` mount. Two consequences:
+
+- **Any** Cranelift or WASI memory-safety bug is instantly *cross-tenant*, not just local.
+- **Any** host panic — `fd_renumber`, your `String::from_utf8_lossy` paths, an `unwrap` in a dependency — kills every concurrent tenant. There's no `catch_unwind` anywhere, and `spawn_blocking` surfaces a panic as a 500 for *that* request while `abort`-on-panic or a poisoned runtime takes the rest with it.
+
+The roadmap treats OS-level hardening as "defense-in-depth around the wasm sandbox," which reads as optional garnish. Invert that. The wasm sandbox is your *fast path*; the process boundary is what makes an escape survivable. Right now an escape is total compromise, and you don't need Kubernetes to fix it.
+
+**The highest-leverage change available to you, and it's cheaper than iteration 2:** a small pool of pre-forked single-tenant worker processes. Parent holds the socket, hands a job to an idle worker over a pipe, worker runs exactly one program and is recycled. Each worker: non-root, `no_new_privs`, seccomp filter, empty network namespace, dedicated tmpfs, `RLIMIT_AS`/`RLIMIT_NPROC`, hard SIGKILL at deadline + grace.
+
+That converts "Cranelift miscompile → read every tenant's code and your host memory" into "Cranelift miscompile → you're loose in an empty, unprivileged, network-less process that gets killed in 5 seconds." It also solves finding #2 for free, since SIGKILL doesn't care what the guest is blocked in. And it gives you a real answer for host panics.
+
+Do this **before** the K8s work. A pod-per-tenant model in iteration 2 is the same idea at 100× the cost and latency; if you get process isolation right locally, the pod layer becomes a scheduling concern rather than a security one.
+
+---
+
+## 5. The performance claim is wrong, and the fix is the interesting part
+
+> *runtimes are compiled once and kept warm; each run adds only microseconds, not container-boot seconds*
+
+You've eliminated **module compilation**. You have not eliminated **instance initialization**, and for CPython those are wildly different numbers. Every request you:
+
+- create a fresh `Store` and instantiate `python.wasm`
+- run CPython's full interpreter bootstrap in the guest — `importlib` setup, `sys.path` construction, frozen module unpacking
+- scan the mounted `/packages` dir on every import
+
+Realistically that's tens to low-hundreds of milliseconds before a single line of user code runs, dominated by guest-side interpreter startup. Not microseconds. Your own demo showing `duration_ms: 26` for trivial Python suggests you're at the good end of that, but the claim is off by three-plus orders of magnitude and the *shape* is wrong: your cost is init-bound, not compile-bound, so "keep modules warm" isn't the optimization that matters.
+
+**The optimization that matters is snapshotting.** Initialize CPython once, run it up to the point just before it executes user code, snapshot linear memory, and restore that image per request. This is what Wizer does for wasm pre-initialization, and what `Config::memory_init_cow` plus `InstanceAllocationStrategy::Pooling` are built to make cheap — copy-on-write from a pre-initialized image, so a fresh instance is an `mmap` rather than an interpreter boot. That's the difference between ~100ms and ~1ms, and it's the thing that would actually justify the "microseconds" claim.
+
+It's completely absent from your roadmap, and it's a bigger win than everything currently listed there.
+
+Two caveats:
+
+- **Sequencing:** pooling allocation is exactly what `RUSTSEC-2026-0088` (data leakage between pooling allocator instances) is about. Upgrade wasmtime first, then turn pooling on. Enabling it on 27.0.0 would add a cross-tenant leak.
+- **Fuel vs epochs:** the roadmap lists "CPU fuel metering." Worth being clear about why. Fuel is deterministic and costs real throughput; epochs are cheap and non-deterministic. For *deadlines*, keep epochs. For *per-tenant accounting or billing*, you want fuel. They're not alternatives — decide which problem you're solving.
+
+---
+
+## 6. On the tiering, and whether the wasm tier earns its keep
+
+The two-tier plan (wasm for pure compute, Firecracker/gVisor for native packages) is the right instinct, but the stated rationale is purely capability — "numpy needs a real libc." The stronger rationale is the one from finding #1: the two tiers have *different TCB shapes*, and a VM's hardware-enforced memory boundary is a genuinely better fit for hostile input.
+
+Which raises the question you should answer explicitly: if you're building the Firecracker tier anyway, why not route everything through it? Snapshot-restored Firecracker microVMs boot in the low tens of milliseconds, which is competitive with un-snapshotted CPython-in-wasm.
+
+The honest answer, and I think it's a good one: **density and p50**. With CoW pooling you can hold thousands of concurrent wasm instances per host at a few MB each and hit single-digit-millisecond starts. Firecracker gives you maybe hundreds of VMs at ~128MB each. If your workload is many short, small, pure-compute runs — agent tool calls, code-eval endpoints, notebook cells — wasm wins on economics by an order of magnitude and the security gap is closable with process isolation. If your workload is fewer, longer, fatter runs, the wasm tier is complexity you don't need.
+
+That's a real architectural thesis, and the README should state it. Right now it reads as "wasm is secure, VMs are for compatibility," which is roughly backwards on the security axis.
+
+---
+
+## 7. The missing document: who is the adversary?
+
+Everything above traces back to one gap. There's no threat model, so the code and the README are describing different products:
+
+| Product | Adversary | What's required |
+|---|---|---|
+| **Playground** | curious user; DoS is fine | roughly what you have, post-fixes |
+| **Multi-tenant SaaS** | paying attacker; cross-tenant leak is fatal | process isolation, per-tenant quotas, audit log, no shared `/packages` |
+| **Agent code-exec** | prompt-injected model output, high volume | all of the above + egress policy + session semantics + determinism |
+
+The README's language ("untrusted code," "isolation … protecting confidentiality & integrity") claims tier 2. The code is built for tier 1. Pick one, write it down at the top of the README, and let it settle the open questions — because "is a shared read-only `/packages` dir acceptable?" has a different answer in each column, and right now nothing in the repo tells you which column you're in.
+
+---
+
+**If I had to order the work:** threat model → wasmtime 36/47 → the eight-row table as real tests (plus `sleep`) → epoch ticker fix → process-per-run → semaphore + global limits → snapshotting/pooling → K8s.
+
+Happy to write this up as a markdown file you can drop in the repo as `docs/threat-model.md`, or sketch the pre-forked worker design in more detail — say which.
+
+Both are answerable concretely. Let me verify the capability question rather than guess — checking what's actually in the CPython build your setup script downloads.
+
+That downloaded build is worth measuring properly rather than inferring. Let me actually run it.
+
+I ran your actual build (`python-3.12.0.wasm`, downloaded from the URL in `setup-runtimes.sh`) under wasmtime and probed it, since A depends on knowing B precisely.
+
+## B: yes, mostly — and `sqlite3` is the reason
+
+The headline: **SQLite is statically linked and fully functional.**
+
+```
+sqlite3 in-memory GROUP BY  -> [('east', 17.75), ('west', 3.0)]
+statistics.linear_regression -> slope=2.06, intercept=-0.10
+statistics.quantiles / correlation -> ([2.25, 4.5, 6.75], 0.9934)
+```
+
+That changes the calculus. Most "report" work is group-by, join, aggregate, sort, pivot — which is SQL's home turf, not numpy's. Between `sqlite3`, `statistics` (which has `linear_regression`, `correlation`, `quantiles`, `fmean`, `multimode`), `decimal`, `datetime`, `csv`, and `graphlib.TopologicalSorter` for dependency ordering, you can cover the large majority of simple reporting and planning tasks without a single third-party package. Your instinct is right.
+
+**But four things are broken that will bite you, and three are one-line fixes.**
+
+| Measured | Impact |
+|---|---|
+| `zoneinfo` → `ZoneInfoNotFoundError` | No tz database. Any timezone-aware date work fails. |
+| `tempfile.gettempdir()` → `FileNotFoundError` | No `/tmp`, `/var/tmp`, `/usr/tmp`, and cwd is `/`. **Any library that touches tempfile internally dies.** |
+| `threading.Thread.start()` → `RuntimeError: can't start new thread` | Imports fine, fails at use. So does `concurrent.futures`. |
+| `asyncio.run()` → `OSError: [Errno 58] Not supported` | Event loop needs a socketpair. `async def` code is dead, not degraded. |
+
+Fixes: `make py-deps PKG=tzdata`; preopen a writable scratch dir and set `TMPDIR` to it; the last two just need documenting.
+
+Also confirmed absent: `ctypes`, `mmap`, `lzma`, `multiprocessing`, `resource`. Present and working: `zlib` 1.2.13, `expat` 2.5.0, `hashlib`, `gzip`/`zipfile`/`tarfile`, `tomllib`, `xml.etree`. `os.cpu_count()` returns 1.
+
+**And a real bug in `py-deps`.** Your flags pull host-native wheels into the mount:
+
+```
+$ pip install --target ... --only-binary :all: pyyaml
+/tmp/pd/yaml/_yaml.cpython-312-x86_64-linux-gnu.so
+```
+
+That `.so` is an x86-64 Linux (or arm64 macOS) shared object, mounted into every Python run, where it's unloadable. PyYAML happens to fall back to pure Python so it "works," but anything with a mandatory C extension fails with a baffling error. Add a post-install gate: scan the target dir for `*.so`/`*.pyd`/`*.dylib`, delete or hard-fail with the package name.
+
+**The honest remaining gap is charts.** No matplotlib. For reports the workable answers are: emit SVG directly (models are decent at hand-writing it), unicode sparklines/bar rows for inline tables, or return structured data and let the caller render. Pick one and say so in the tool description, or the model will keep reaching for matplotlib.
+
+---
+
+## A: what to advertise
+
+Two principles that matter more than wording. First, **the model's prior is full CPython with the PyPI ecosystem** — so the unavailable list is doing more work than the available list. Second, **redirect rather than deny**: `numpy is unavailable` produces flailing; `use sqlite3 for tabular aggregation` produces working code on the next call.
+
+```
+Execute a self-contained Python 3.12 script and return its output.
+
+CONTRACT
+- Print results to stdout — stdout is the return value. Nothing else is captured.
+- Each call is a fresh process. No variables, files, or state persist between calls.
+- Inline all input data as literals in the code. There is no filesystem to read
+  and no network access.
+
+LIMITS
+- 5s default / 30s max wall clock. 256 MB memory. Output truncated at ~30 KB.
+
+NOT AVAILABLE — these fail at runtime, do not use
+- Compiled third-party packages: numpy, pandas, matplotlib, scipy, polars,
+  pillow, lxml, pydantic v2
+- Network: socket, urllib, requests, http.client
+- Processes: subprocess, os.system, multiprocessing
+- Concurrency: threading (cannot start threads), asyncio, concurrent.futures
+- Also absent: ctypes, mmap, lzma, tempfile, zoneinfo
+
+AVAILABLE — the full Python 3.12 standard library otherwise, notably
+- sqlite3 (in-memory): USE THIS for grouping, joining, aggregating and sorting
+  tabular data instead of pandas. Load rows with executemany, query with SQL.
+- statistics: mean, median, stdev, quantiles, correlation, linear_regression
+- json, csv, re, decimal, fractions, math, datetime, timedelta, calendar
+- itertools, functools, collections, heapq, bisect, dataclasses, enum
+- graphlib.TopologicalSorter for dependency and task ordering
+- textwrap, pprint, difflib, hashlib, base64, gzip, zipfile, tomllib, xml.etree
+
+For tabular output, format results as an aligned text table with str.ljust or f-strings.
+```
+
+Roughly 250 tokens. It buys back far more than that in avoided failed calls.
+
+**Schema:** drop `args` and `stdin` — a model will inline its data, and every unused parameter is a chance to guess wrong. Keep `code` and `timeout_ms`, and make `code`'s description carry the contract: *"Self-contained Python 3.12. Print results to stdout."*
+
+**The highest-ROI thing you can build** is turning failures into redirects. Intercept the common ones server-side and rewrite the message:
+
+| Model writes | Return instead of the raw traceback |
+|---|---|
+| `import pandas` | `pandas is unavailable. Use sqlite3 for grouping/aggregating tabular data, or the csv + statistics modules.` |
+| `import numpy` | `numpy is unavailable. Use the statistics module, or math with list comprehensions.` |
+| `import requests` / `urllib` | `No network access. Inline the data you need into the code.` |
+| `matplotlib` | `No plotting. Emit SVG as text, or print a unicode bar chart.` |
+| `threading` / `asyncio` | `No concurrency in this sandbox. Write sequential code.` |
+| `tempfile` | `No temp directory. Keep data in memory.` |
+
+A dict of maybe fifteen entries, matched against the traceback. Models self-correct almost perfectly from a message that names the alternative, and barely at all from `ModuleNotFoundError: No module named 'pandas'`.
+
+Then measure it: log the failed import on every run for a week. That distribution tells you whether the wasm tier is the product or a stepping stone — which is the same question from three turns ago, but answered with your traffic instead of my speculation.
+
+I can hand you the probe script I used as a `make capabilities` target, so this table regenerates itself whenever you change the runtime or bump wasmtime. Useful as a regression test too.
+
+capabilities python
+#!/usr/bin/env python3
+"""
+Capability and isolation probe for code-sandbox.
+
+Runs a set of probes through the service's own POST /run endpoint, so it
+measures the configuration you actually ship (DirPerms, env, StoreLimits,
+wasmtime version) rather than a generic wasmtime harness.
+
+Produces:
+  - a human-readable report on stdout
+  - a machine-readable snapshot at scripts/capabilities.json
+
+Usage:
+    python3 scripts/probe-capabilities.py                  # report + write baseline
+    python3 scripts/probe-capabilities.py --check          # compare to baseline, exit 1 on regression
+    python3 scripts/probe-capabilities.py --url http://host:8080
+    python3 scripts/probe-capabilities.py --json           # snapshot only, no table
+
+Host side is stdlib-only. The server must already be running (make run).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASELINE = os.path.join(HERE, "capabilities.json")
+
+# --------------------------------------------------------------------------
+# Guest-side probe. Runs INSIDE the sandbox and prints one JSON object.
+# Must not contain triple-quoted strings.
+# --------------------------------------------------------------------------
+
+GUEST_PROBE = r'''
+import sys, json, importlib
+
+MODULES = """
+json csv re textwrap pprint string statistics math cmath decimal fractions random secrets
+datetime zoneinfo calendar time itertools functools collections heapq bisect operator graphlib
+dataclasses enum typing abc sqlite3 unicodedata difflib hashlib hmac base64 binascii struct
+array gzip zipfile tarfile bz2 lzma zlib configparser tomllib html argparse pathlib io
+tempfile os shutil glob fnmatch uuid pickle copy shelve dbm locale unittest doctest logging
+warnings traceback inspect ast dis sysconfig platform socket ssl subprocess threading
+multiprocessing asyncio queue select signal ctypes mmap resource pwd grp termios curses
+readline urllib.request http.client concurrent.futures xml.etree.ElementTree
+"""
+
+imports = {}
+for name in MODULES.split():
+    try:
+        importlib.import_module(name)
+        imports[name] = "ok"
+    except BaseException as e:
+        imports[name] = type(e).__name__
+
+
+def probe(fn):
+    """Run fn; return 'ok:<repr>' or 'fail:<ExcName>: <msg>'."""
+    try:
+        return "ok:" + repr(fn())[:120]
+    except BaseException as e:
+        return "fail:%s: %s" % (type(e).__name__, str(e)[:100])
+
+
+# ---- functional checks: does it actually work, not just import ----------
+
+def _sqlite_groupby():
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("create table s(region text, amt real)")
+    c.executemany("insert into s values(?,?)",
+                  [("east", 10.5), ("west", 3.0), ("east", 7.25)])
+    return list(c.execute(
+        "select region, round(sum(amt),2) t from s group by region order by t desc"))
+
+
+def _stats():
+    import statistics
+    lr = statistics.linear_regression([1, 2, 3, 4], [2, 4, 6, 8.2])
+    return (round(lr.slope, 3),
+            statistics.quantiles([1, 2, 3, 4, 5, 6, 7, 8]),
+            round(statistics.correlation([1, 2, 3], [2, 4, 7]), 4))
+
+
+def _zoneinfo():
+    import datetime, zoneinfo
+    return datetime.datetime(2026, 7, 28, 12,
+                             tzinfo=zoneinfo.ZoneInfo("America/New_York")).isoformat()
+
+
+def _threads():
+    import threading
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    return "started"
+
+
+def _asyncio():
+    import asyncio
+    async def go():
+        await asyncio.sleep(0)
+        return "coro"
+    return asyncio.run(go())
+
+
+def _tempfile():
+    import tempfile
+    return tempfile.gettempdir()
+
+
+def _decimal():
+    import decimal
+    decimal.getcontext().prec = 28
+    return str(decimal.Decimal(1) / decimal.Decimal(7))
+
+
+def _graphlib():
+    import graphlib
+    ts = graphlib.TopologicalSorter({"deploy": {"build"}, "build": {"lint"}})
+    return list(ts.static_order())
+
+
+def _csv_out():
+    import csv, io
+    b = io.StringIO()
+    csv.writer(b).writerows([[1, 2], [3, 4]])
+    return b.getvalue()
+
+
+FUNCTIONAL = [
+    ("sqlite3 in-memory GROUP BY", _sqlite_groupby),
+    ("statistics regression/quantiles", _stats),
+    ("decimal high precision", _decimal),
+    ("graphlib topological sort", _graphlib),
+    ("datetime arithmetic", lambda: __import__("datetime").date(2026, 7, 28).isoformat()),
+    ("zoneinfo named timezone", _zoneinfo),
+    ("csv writer", _csv_out),
+    ("gzip roundtrip", lambda: len(__import__("gzip").compress(b"x" * 1000))),
+    ("hashlib sha256", lambda: __import__("hashlib").sha256(b"a").hexdigest()[:12]),
+    ("secrets token", lambda: len(__import__("secrets").token_hex(8))),
+    ("threading start thread", _threads),
+    ("asyncio.run", _asyncio),
+    ("tempfile.gettempdir", _tempfile),
+]
+
+functional = {name: probe(fn) for name, fn in FUNCTIONAL}
+
+
+# ---- isolation checks: mirrors the README security table ---------------
+
+def _write(path):
+    def go():
+        with open(path, "w") as f:
+            f.write("probe")
+        return "WROTE"
+    return go
+
+
+def _listdir(path):
+    return lambda: sorted(__import__("os").listdir(path))[:12]
+
+
+ISOLATION = [
+    ("read host file /etc/passwd", lambda: open("/etc/passwd").read(16)),
+    ("read host file /etc/hosts", lambda: open("/etc/hosts").read(16)),
+    ("list host root /", _listdir("/")),
+    ("write to own code dir /sandbox", _write("/sandbox/probe.tmp")),
+    ("write to shared /packages", _write("/packages/probe.tmp")),
+    ("write to /tmp", _write("/tmp/probe.tmp")),
+    ("open network socket", lambda: __import__("socket").socket()),
+    ("spawn process", lambda: __import__("subprocess").run(["echo", "x"])),
+    ("os.system", lambda: __import__("os").system("echo x")),
+    ("native FFI via ctypes", lambda: __import__("ctypes").CDLL(None)),
+    ("read host environment", lambda: sorted(__import__("os").environ.keys())),
+]
+
+isolation = {name: probe(fn) for name, fn in ISOLATION}
+
+runtime = {
+    "python": sys.version.split()[0],
+    "platform": sys.platform,
+    "cwd": probe(lambda: __import__("os").getcwd()),
+    "cpu_count": probe(lambda: __import__("os").cpu_count()),
+    "builtin_module_count": len(sys.builtin_module_names),
+    "maxsize_bits": sys.maxsize.bit_length() + 1,
+}
+
+print(json.dumps({
+    "runtime": runtime,
+    "imports": imports,
+    "functional": functional,
+    "isolation": isolation,
+}))
+'''
+
+# --------------------------------------------------------------------------
+# Host-side probes that must run as their own request (they end the run).
+# Each: (label, code, request_timeout_ms, expectation, max_wall_seconds)
+# --------------------------------------------------------------------------
+
+LIMIT_PROBES = [
+    (
+        "cpu exhaustion (infinite loop)",
+        "while True: pass",
+        1000,
+        "timed_out",
+        4.0,
+    ),
+    (
+        "host-blocking sleep vs timeout",
+        "import time; time.sleep(15); print('SLEEP COMPLETED')",
+        1000,
+        "timed_out",
+        4.0,
+    ),
+    (
+        "memory bomb (400MB alloc)",
+        "b = bytearray(400*1024*1024); print(len(b))",
+        10000,
+        "memory_capped",
+        20.0,
+    ),
+    (
+        "output flood (5MB stdout)",
+        "print('x'*5*1024*1024)",
+        10000,
+        "output_capped",
+        20.0,
+    ),
+]
+
+
+def post_run(url, code, timeout_ms, http_timeout):
+    body = json.dumps({"language": "python", "code": code,
+                       "timeout_ms": timeout_ms}).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/run", data=body,
+        headers={"content-type": "application/json"})
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as r:
+            return json.loads(r.read()), time.monotonic() - t0
+    except urllib.error.HTTPError as e:
+        return {"_http_error": e.code, "_body": e.read()[:400].decode("utf8", "replace")}, \
+               time.monotonic() - t0
+    except Exception as e:
+        return {"_transport_error": "%s: %s" % (type(e).__name__, e)}, \
+               time.monotonic() - t0
+
+
+def classify_limit(label, expectation, resp, wall, budget):
+    """Return (verdict, detail). verdict in {PASS, FAIL, WARN}."""
+    if "_transport_error" in resp or "_http_error" in resp:
+        return "FAIL", resp.get("_transport_error") or ("HTTP %s" % resp["_http_error"])
+
+    out = (resp.get("stdout") or "") + (resp.get("stderr") or "")
+    over = wall > budget
+
+    if expectation == "timed_out":
+        if resp.get("timed_out") and not over:
+            return "PASS", "killed in %.2fs" % wall
+        if resp.get("timed_out") and over:
+            return "FAIL", "eventually timed out but took %.1fs (deadline not enforced promptly)" % wall
+        if "SLEEP COMPLETED" in out:
+            return "FAIL", "run completed despite timeout_ms=1000 (%.1fs) - epoch cannot interrupt host calls" % wall
+        return "FAIL", "not timed out (%.1fs); trapped=%s exit=%s" % (
+            wall, resp.get("trapped"), resp.get("exit_code"))
+
+    if expectation == "memory_capped":
+        if resp.get("trapped") or "MemoryError" in out:
+            return "PASS", "capped in %.2fs" % wall
+        return "FAIL", "allocation succeeded (%.1fs) - StoreLimits not enforced" % wall
+
+    if expectation == "output_capped":
+        n = len(resp.get("stdout") or "")
+        if n < 5 * 1024 * 1024:
+            flag = "" if "truncat" in json.dumps(resp).lower() else \
+                   " - WARNING: truncated silently, no flag in response"
+            return ("PASS" if not flag else "WARN"), "stdout %d bytes%s" % (n, flag)
+        return "FAIL", "returned full %d bytes" % n
+
+    return "WARN", "no expectation defined"
+
+
+def render(snapshot):
+    r = snapshot["runtime"]
+    print("\n" + "=" * 68)
+    print("  code-sandbox capability probe")
+    print("=" * 68)
+    print("  Python %s   platform=%s   cwd=%s   cpus=%s"
+          % (r["python"], r["platform"], r["cwd"].replace("ok:", ""),
+             r["cpu_count"].replace("ok:", "")))
+
+    imports = snapshot["imports"]
+    avail = sorted(k for k, v in imports.items() if v == "ok")
+    miss = sorted((k, v) for k, v in imports.items() if v != "ok")
+
+    print("\n-- STDLIB IMPORTS -------------------------------------------------")
+    print("   available: %d" % len(avail))
+    line = "     "
+    for m in avail:
+        if len(line) + len(m) > 66:
+            print(line); line = "     "
+        line += m + " "
+    if line.strip():
+        print(line)
+    print("   unavailable: %d" % len(miss))
+    for m, why in miss:
+        print("     %-26s %s" % (m, why))
+
+    print("\n-- FUNCTIONAL (imports are not enough) ---------------------------")
+    for name, res in snapshot["functional"].items():
+        ok = res.startswith("ok:")
+        print("   %-4s %-34s %s" % ("OK" if ok else "FAIL", name, res.split(":", 1)[1][:60]))
+
+    print("\n-- ISOLATION (should all be DENIED) ------------------------------")
+    for name, res in snapshot["isolation"].items():
+        denied = res.startswith("fail:")
+        detail = res.split(":", 1)[1][:58]
+        print("   %-8s %-32s %s" % ("denied" if denied else "*ALLOWED*", name, detail))
+
+    print("\n-- LIMITS --------------------------------------------------------")
+    for name, verdict, detail in snapshot["limits"]:
+        print("   %-4s %-34s %s" % (verdict, name, detail))
+    print("=" * 68 + "\n")
+
+
+def regressions(new, old):
+    """Report only changes that make the sandbox weaker or less capable."""
+    out = []
+    for m, v in old.get("imports", {}).items():
+        if v == "ok" and new["imports"].get(m) != "ok":
+            out.append("import lost: %s (was ok, now %s)" % (m, new["imports"].get(m)))
+    for k, v in old.get("functional", {}).items():
+        if v.startswith("ok:") and not new["functional"].get(k, "").startswith("ok:"):
+            out.append("functional regression: %s" % k)
+    for k, v in old.get("isolation", {}).items():
+        if v.startswith("fail:") and not new["isolation"].get(k, "").startswith("fail:"):
+            out.append("ISOLATION BREACH: %s is now permitted" % k)
+    oldl = {n: verd for n, verd, _ in old.get("limits", [])}
+    for n, verd, detail in new["limits"]:
+        if oldl.get(n) == "PASS" and verd != "PASS":
+            out.append("limit regression: %s (%s)" % (n, detail))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default=os.environ.get("SANDBOX_URL", "http://127.0.0.1:8080"))
+    ap.add_argument("--check", action="store_true",
+                    help="compare against committed baseline; exit 1 on regression")
+    ap.add_argument("--json", action="store_true", help="emit snapshot only")
+    ap.add_argument("--write-baseline", action="store_true",
+                    help="overwrite the baseline with this run")
+    args = ap.parse_args()
+
+    resp, _ = post_run(args.url, GUEST_PROBE, 30000, 60)
+    if "_transport_error" in resp:
+        sys.exit("cannot reach %s: %s\nIs the server running? (make run)"
+                 % (args.url, resp["_transport_error"]))
+    if "_http_error" in resp:
+        sys.exit("HTTP %s from /run: %s" % (resp["_http_error"], resp["_body"]))
+    if not (resp.get("stdout") or "").strip():
+        sys.exit("probe produced no stdout.\nstderr: %s\nerror: %s"
+                 % (resp.get("stderr", "")[:600], resp.get("error")))
+
+    try:
+        snapshot = json.loads(resp["stdout"].strip().splitlines()[-1])
+    except json.JSONDecodeError as e:
+        sys.exit("could not parse probe output (%s):\n%s" % (e, resp["stdout"][:600]))
+
+    snapshot["limits"] = []
+    for label, code, tmo, expectation, budget in LIMIT_PROBES:
+        r, wall = post_run(args.url, code, tmo, budget + 30)
+        verdict, detail = classify_limit(label, expectation, r, wall, budget)
+        snapshot["limits"].append([label, verdict, detail])
+
+    snapshot["_meta"] = {"url": args.url, "probed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+
+    if args.json:
+        print(json.dumps(snapshot, indent=2))
+    else:
+        render(snapshot)
+
+    old = None
+    if os.path.exists(BASELINE):
+        with open(BASELINE) as f:
+            old = json.load(f)
+
+    if args.check:
+        if old is None:
+            sys.exit("no baseline at %s; run without --check first" % BASELINE)
+        regs = regressions(snapshot, old)
+        if regs:
+            print("REGRESSIONS vs baseline (%s):" % old.get("_meta", {}).get("probed_at", "?"))
+            for r in regs:
+                print("  - " + r)
+            sys.exit(1)
+        print("no regressions vs baseline.")
+        return
+
+    if old is None or args.write_baseline:
+        with open(BASELINE, "w") as f:
+            json.dump(snapshot, f, indent=2, sort_keys=True)
+        print("baseline written to %s" % BASELINE)
+    else:
+        regs = regressions(snapshot, old)
+        if regs:
+            print("NOTE: %d change(s) vs baseline. Run --check in CI, "
+                  "or --write-baseline to accept:" % len(regs))
+            for r in regs:
+                print("  - " + r)
+
+
+if __name__ == "__main__":
+    main()
+
+
+capabilities: ## Probe sandbox capabilities + isolation, write baseline
+	@python3 scripts/probe-capabilities.py
+
+capabilities-check: ## Fail if capabilities or isolation regressed (CI)
+	@python3 scripts/probe-capabilities.py --check
+
+There's exactly one other place to put the boundary, and the whole conversation has been circling it.
+
+## The reframe
+
+Every isolation technology we've discussed sits *below* the interpreter:
+
+```
+your code:      [ unsafe C interpreter ] → [ wasm VM ] → host      boundary is BELOW the interpreter
+microVM:        [ anything ]             → [ hardware ] → host      boundary is BELOW everything
+```
+
+The Lehmann paper's lesson is that this arrangement doesn't protect the interpreter *from itself* — QuickJS can still be corrupted, the boundary just contains where the corruption lands. You're stacking a safe VM under an unsafe interpreter and hoping the VM catches what the interpreter lets through.
+
+The other approach inverts it: **make the interpreter itself the boundary.**
+
+```
+other approach: [ memory-safe interpreter that has no dangerous ops ] → host
+```
+
+No VM, no hypervisor, no kernel features. The sandbox is a property of the interpreter, so it runs anywhere the interpreter compiles — which is anywhere. That is the *only* genuinely cloud/platform-agnostic isolation model, because it needs nothing from the platform at all. wasm was your proxy for "portable"; a pure-userspace interpreter is portable without the proxy.
+
+Two things have to be true of that interpreter, and they're the two the paper attacks:
+
+1. **Memory-safe by construction** — written in Rust (or another safe language), so §5.3's corruption class doesn't exist. There is no linear memory to smash because there's no unsafe C.
+2. **Capability-secure by construction** — it implements no filesystem, no network, no process ops. Not "denied" — *absent*. The paper's own §7.3 recommendation ("only expose the host APIs strictly necessary") taken to its endpoint: a fresh interpreter you built, not a port of a full runtime that drags CPython's or QuickJS's entire surface along.
+
+Your current design satisfies #2 (minimal WASI imports) but violates #1 (QuickJS is unsafe C). This approach gets both.
+
+## What it costs, stated honestly
+
+You trade a **battle-tested but unsafe** runtime for a **safe but thinner** one. The TCB shrinks dramatically — from "Cranelift + a C interpreter" down to "one Rust interpreter you can actually audit" — but the language surface shrinks too.
+
+The candidates, by how much they change your product:
+
+**JavaScript → Boa** (pure-Rust JS engine). Drop-in conceptually: it's still "run JS," but the engine is memory-safe Rust instead of QuickJS-in-wasm. Slower than QuickJS, and not 100% spec-complete on edges, but for agent-generated snippets that's rarely the binding constraint. This is the smallest change and it directly retires the §5.3 exposure for your JS path.
+
+**Python → RustPython** (pure-Rust Python). Here's the catch, and I checked: the thing that made your Python capability story work was `sqlite3`, and that's a *C library*. A pure-Rust Python doesn't get CPython's C-extension stdlib for free. There are pure-Rust and wasm SQLite paths (`sqlite-wasm-rs`, rusqlite-on-WASI), but the mature WASI-friendly ones are often read-only, and SQLite's locking and WAL assumptions break in sandboxed environments. [GitHub](https://github.com/execve-ai/sqlite-wasm-reader) So RustPython buys you memory safety and costs you the exact stdlib depth that made Python attractive for reports. That's a real regression, not a wash.
+
+**Restricted language → Starlark or Lua-in-Rust.** The strongest security posture, and a different philosophy: don't sandbox a dangerous language, use one that was designed to be incapable. Starlark (Bazel's config language — Python-*like*, deterministic, hermetic, no ambient I/O by construction) has a maintained pure-Rust implementation. A pure-Rust Lua (e.g. `piccolo`) is memory-safe with a real GC. You give up "run arbitrary Python"; you gain a runtime where the dangerous operations were never designed in, plus — connecting to the thing I flagged two turns ago — **determinism you get almost for free.** Starlark is deterministic by design; that's the bit-reproducible-replay product no microVM can easily offer.
+
+## The synthesis, if you don't want to abandon wasm
+
+You don't have to choose between "wasm" and "memory-safe interpreter" — the sharpest version is **both**:
+
+```
+[ memory-safe Rust interpreter ] compiled to → [ wasm32-wasi ] → host
+```
+
+Now the paper's attack class is gone (the interpreter is safe Rust, nothing to corrupt) *and* you keep wasm as a portable second boundary for defense-in-depth *and* it's still cloud-agnostic. This is Boa-in-wasm or RustPython-in-wasm. The only layer you're actually deleting from your current stack is the *unsafe C interpreter* — you swap QuickJS.wasm for Boa.wasm and change nothing else. Your `runtime.rs`, your limits, your capability grants all stay.
+
+That's the cleanest evolution of what you have: same architecture, same portability, minus the one component the paper showed was the weak link.
+
+## The decision
+
+The honest fork is what you're willing to give up:
+
+- **Keep full CPython stdlib (sqlite3 et al.)** → you're stuck with the unsafe-C-in-wasm model, and your security ceiling is "process isolation + wasmtime patch cadence." That's defensible for single-tenant/internal, which is where we landed.
+- **Want the memory-safety problem to actually disappear** → accept a thinner language. Boa for JS is the low-regret move. For Python, RustPython costs you the stdlib depth; Starlark costs you Python-compatibility but hands you determinism.
+
+There is no pure-userspace option that gives you *both* CPython's full battle-tested stdlib *and* memory safety — that combination is exactly what doesn't exist yet, and pretending otherwise is how you'd end up back at "QuickJS in wasm, hope Cranelift holds."
+
+Given your actual workload — agent tool calls doing reports and planning — I'd prototype **Boa-in-wasm for JS** (nearly free, retires the paper's finding for that path) and **measure whether Starlark covers your Python report tasks** before assuming you need CPython at all. Group-by, filter, arithmetic, format-a-table is squarely in Starlark's range, and if it fits, you get the strongest and most portable and most deterministic option simultaneously. Run your capability probe against both and let the numbers pick.
+
