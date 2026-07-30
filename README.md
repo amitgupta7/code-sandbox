@@ -5,6 +5,8 @@ Code executes inside a **wasmtime** WebAssembly sandbox — no host filesystem, 
 network, no processes, with hard memory and time limits — and you get back
 `stdout`, `stderr`, and the exit code.
 
+<img width="1408" height="768" alt="Gemini_Generated_Image_w05gzpw05gzpw05g" src="https://github.com/user-attachments/assets/d6779563-dd17-4903-b9e4-6329498113f9" />
+
 ![code-sandbox console demo](recordings/console-demo.gif)
 
 > The built-in browser console running code and watching the sandbox block
